@@ -716,6 +716,20 @@ pub fn emit(
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
+        // A wave64 program still asking for 64-lane waves on a 32-lane host (NVIDIA): the
+        // branches around what needs every lane (wave reductions, LDS where lanes branch
+        // apart) taken wave-wide, as the console runs them, may let it run in halves.
+        Ok((shader, Some(64)))
+            if native.stage == HwStage::Cs
+                && native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+        {
+            match widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false) {
+                Ok((s, w)) if w != Some(64) => Ok((s, w)),
+                _ => Ok((shader, Some(64))),
+            }
+        }
         other => other,
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {

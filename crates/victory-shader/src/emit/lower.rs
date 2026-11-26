@@ -1009,6 +1009,23 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// `VICTORY_NO_LOCAL_TONEMAP=1`: see `smem`. Part of the translation: the
+/// shader cache keys on it (every `VICTORY_*` switch the translator reads).
+fn no_local_tonemap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_LOCAL_TONEMAP").is_some_and(|v| v == "1"))
+}
+
+/// The title's final composite (PS_CompositeNMB, run hash 6318f669e4f17d65):
+/// its code reads the local tone mapping switch and tests it, as
+/// `s_buffer_load_dword s0, s[52:55], 0x3c0; v_mov_b32 v14, 1.0;
+/// s_waitcnt lgkmcnt(0); s_cmp_eq_u32 s0, 0; s_cbranch_scc1`.
+fn is_local_tonemap_composite(code: &[u8]) -> bool {
+    const WORDS: [u32; 6] = [0xF420_001A, 0xFA00_03C0, 0x7E1C_02F2, 0xBF8C_C07F, 0xBF06_8000, 0xBF85_0048];
+    let pattern: Vec<u8> = WORDS.iter().flat_map(|w| w.to_le_bytes()).collect();
+    code.windows(pattern.len()).any(|w| w == pattern.as_slice())
+}
+
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -6940,6 +6957,15 @@ impl<'a> Lower<'a> {
         let Some(Operand::Scalar { code, .. }) = *data else {
             return Err("a scalar buffer load");
         };
+        // `VICTORY_NO_LOCAL_TONEMAP=1` (diagnostics): the title's final
+        // composite (PS_CompositeNMB) reads its local tone mapping switch
+        // as 0, so it leaves out the bilateral grid (to tell whether the
+        // grid is what bands the picture on 32-lane hosts).
+        if count == 1 && *offset == 0x3c0 && no_local_tonemap() && is_local_tonemap_composite(&self.x.native.code) {
+            let zero = self.s.m.i32(0);
+            self.write(inst, Reg::S(code), zero, None);
+            return Ok(());
+        }
         let src = self
             .descriptors
             .get(&(site, false))
