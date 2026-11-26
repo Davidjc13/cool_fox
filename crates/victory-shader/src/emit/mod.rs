@@ -121,7 +121,8 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MESHLET, SLOT_MEMORY, SLOT_STRIDES,
+    meshlet_scratch_bytes,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -451,8 +452,10 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5): 1024 threads, sixteen
-    // console waves. Exchanges stay inside each wave. This does not widen
-    // branches and does not use the face shader's half-meet flag.
+    // console waves. Exchanges stay inside each wave. A shared-memory read
+    // and write that not every lane runs is taken by the whole wave, then
+    // the two halves meet. This does not call `widen` and does not use the
+    // face shader's half-meet flag.
     let meshlets = c.digest == MESHLETS
         && native.stage == HwStage::Cs
         && native.wave64
@@ -849,6 +852,75 @@ const MESHLETS: [u8; 16] = [
 /// half that does not run the block, is a named refusal. The program never
 /// comes out still asking for wave 64.
 fn meshlet_emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    // A branch taken by the whole wave changes which later branches are
+    // per-lane. Repeat until every read-and-write region is covered, or a
+    // pass adds nothing: that one is refused below, not forced.
+    let mut wide = std::collections::HashSet::new();
+    let mut widened: Option<structure::Structured> = None;
+    loop {
+        let at = widened.as_ref().unwrap_or(st);
+        let branches = lower::meshlet_lds_branches(p, at)
+            .map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+        if branches.iter().all(|b| wide.contains(b)) {
+            break;
+        }
+        wide.extend(branches);
+        widened = Some(structure::structure_wide(p, &wide)?);
+    }
+    // An exchange that one half does not run names its block. The per-lane
+    // branch around it is taken by the whole wave, then the two halves meet.
+    // A pass that adds no branch, or a branch with no wave-wide meaning, keeps
+    // the named refusal. The other waves of the group do not wait.
+    loop {
+        lower::take_needs();
+        let outcome = if let Some(st) = &widened {
+            let io = io::raise(p, native)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(st))?;
+            meshlet_lower(c, native, p, st, &io, &res)
+        } else {
+            meshlet_lower(c, native, p, st, io, res)
+        };
+        match outcome {
+            Ok(shader) => {
+                let _ = lower::take_needs();
+                return Ok(shader);
+            }
+            Err(ShaderError::Unsupported { what, .. })
+                if what == lower::MESHLET_HALF || lower::needs_every_lane(what) =>
+            {
+                let needs = lower::take_needs();
+                let at = widened.as_ref().unwrap_or(st);
+                let Some(branches) = lower::branches_around(at, &needs) else {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: lower::MESHLET_WAVE,
+                    });
+                };
+                if branches.iter().all(|b| wide.contains(b)) {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: lower::MESHLET_HALF,
+                    });
+                }
+                wide.extend(branches);
+                widened = Some(structure::structure_wide(p, &wide)?);
+            }
+            Err(e) => {
+                let _ = lower::take_needs();
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn meshlet_lower(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

@@ -1842,6 +1842,17 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MESHLET {
+                    if let Some(gpu) = crate::host::bind_meshlet_scratch(&list.list) {
+                        // SAFETY: an open list; the buffer lives for the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_MEET {
                     if let Some(gpu) = crate::host::bind_defrag_counter(&list.list) {
                         // SAFETY: an open list; the buffer lives for the process.
