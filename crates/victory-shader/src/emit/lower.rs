@@ -403,6 +403,12 @@ struct Lower<'a> {
     /// Meshlets: the same per-wave meet, for an exchange of the two halves only.
     /// Shader LDS is not ordered this way, and the face-shader counters stay put.
     wave_exchange: bool,
+    /// The exchange, the meet and the wave counter live in [`SLOT_MESHLET`]:
+    /// the group's shared memory is already full.
+    exchange_uav: bool,
+    /// Byte offset of this group's scratch, and the raw-buffer handle.
+    scratch_base: Option<V>,
+    scratch_uav: Option<V>,
     /// First LDS dword of the per-wave meet table, and how many sites fit.
     meet_base: u32,
     meet_cap: u32,
@@ -1166,9 +1172,14 @@ pub(super) fn half_meets() -> bool {
 
 /// An LDS read and a write share one region that not every lane runs, in a
 /// group of several console waves. A group barrier there waits for threads
-/// that never arrive, and a per-wave meet is not this lowering.
+/// that never arrive. Refused when the branch around it cannot be taken by
+/// both halves of the wave.
 pub(super) const MESHLET_LDS_REGION: &str =
     "an LDS read and write in one lane region of several console waves";
+
+/// The branch around that region has no wave-wide meaning, so both halves
+/// cannot be sent the same way.
+pub(super) const MESHLET_WAVE: &str = "a meshlet branch whose wave-wide meaning is not known";
 
 /// An `s_barrier` stands where not every thread of the group arrives.
 pub(super) const MESHLET_BARRIER: &str = "a group barrier not every thread of the group reaches";
@@ -1200,6 +1211,102 @@ pub(super) fn meshlet_exchange(p: &Program, st: &Structured) -> Result<(), &'sta
         }
     }
     Ok(())
+}
+
+/// Blocks of a not-all-lane region that both reads and writes LDS, unless
+/// every access there is the same commuting reduction ([`lds_meetings`]).
+fn lds_conflict_blocks(p: &Program, st: &Structured, all: &[bool]) -> Vec<usize> {
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut region: Vec<usize> = (0..n).collect();
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. })
+            && !name.starts_with("ds_swizzle")
+            && !name.contains("permute"))
+        .then_some(name)
+    };
+    let mut reads = vec![false; n];
+    let mut writes = vec![false; n];
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for name in block.insts.iter().filter_map(lds_op) {
+            if name.starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        let mut ops = blocks.iter().flat_map(|&b| p.blocks[b].insts.iter().filter_map(lds_op));
+        if let Some(op) = ops.next()
+            && matches!(
+                op,
+                "ds_add_u32"
+                    | "ds_sub_u32"
+                    | "ds_and_b32"
+                    | "ds_or_b32"
+                    | "ds_xor_b32"
+                    | "ds_min_i32"
+                    | "ds_max_i32"
+                    | "ds_min_u32"
+                    | "ds_max_u32"
+            )
+            && ops.all(|next| next == op)
+        {
+            continue;
+        }
+        out.extend(blocks);
+    }
+    out
+}
+
+/// Per-lane branches around a shared-memory read and write. Empty when the
+/// two halves already run every such access. Marking the branches wave-wide
+/// sends both halves in together; the other console waves do not wait.
+pub(super) fn meshlet_lds_branches(p: &Program, st: &Structured) -> Result<Vec<usize>, &'static str> {
+    let Some(all) = all_lane_blocks(st) else {
+        return Err(MESHLET_INDIRECT);
+    };
+    let blocks = lds_conflict_blocks(p, st, &all);
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(branches) = branches_around(st, &blocks) else {
+        return Err(MESHLET_WAVE);
+    };
+    if branches.is_empty() {
+        return Err(MESHLET_LDS_REGION);
+    }
+    Ok(branches)
 }
 
 /// Runs `f` while each console wave exchanges its two host halves on its own
@@ -1735,17 +1842,46 @@ impl<'a> Lower<'a> {
         // A site that does not fit is refused rather than declared past the host's 32 KiB.
         let half_meet = HALF_MEETS.get() && s.wave_size == Some(32);
         let wave_exchange = WAVE_EXCHANGE.get() && s.wave_size == Some(32) && !half_meet;
+        let mut exchange_uav = false;
         let (meet_base, meet_cap, meet_waves, meet_tally, wave_all, group_all) = if half_meet || wave_exchange {
             let group = s.threads.map(|t| t.into_iter().product::<u32>()).unwrap_or(0);
             let waves = group.div_ceil(64).max(1);
             // Three dwords past the table count meetings, wait polls and wait atomics.
             let spare = HOST_LDS_DWORDS.saturating_sub(s.lds_dwords).saturating_sub(3);
             let per = 2 * waves;
-            let cap = if per == 0 { 0 } else { spare / per };
-            let base = s.lds_dwords;
-            s.lds_dwords += cap * per;
-            let tally = s.lds_dwords;
-            s.lds_dwords += 3;
+            // Meshlets reuse one pair per console wave. Both halves run the same
+            // meets in order, and each visit raises the count. The face shader
+            // keeps a pair for every site.
+            let cap = if per == 0 {
+                0
+            } else if wave_exchange {
+                u32::from(spare >= per)
+            } else {
+                spare / per
+            };
+            // The declaration already fills the 32 KiB. The exchange pair, the
+            // one reused meet and the wave counter move to a buffer. The
+            // shader's own shared memory is left where it is.
+            let uav = wave_exchange
+                && cap == 0
+                && waves == super::shader::MESHLET_SCRATCH_WAVES
+                && exchange.is_some()
+                && halves.is_some();
+            let (base, cap, tally) = if uav {
+                s.lds_dwords = s.lds_dwords.saturating_sub(2 * waves + 1);
+                if let Some(ex) = exchange.as_mut() {
+                    ex.0 = 0;
+                }
+                halves = Some(super::shader::MESHLET_SCRATCH_STRIDE - 1);
+                exchange_uav = true;
+                (2 * waves, 1, 0)
+            } else {
+                let base = s.lds_dwords;
+                s.lds_dwords += cap * per;
+                let tally = s.lds_dwords;
+                s.lds_dwords += 3;
+                (base, cap, tally)
+            };
             (
                 base,
                 cap,
@@ -1955,6 +2091,9 @@ impl<'a> Lower<'a> {
             abort: None,
             half_meet,
             wave_exchange,
+            exchange_uav,
+            scratch_base: None,
+            scratch_uav: None,
             meet_base,
             meet_cap,
             meet_waves,
@@ -2566,6 +2705,9 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         if self.half_meet || self.wave_exchange {
             // The meet slots start at zero, then the wave counter, both before any thread leaves.
+            if self.exchange_uav {
+                self.take_scratch();
+            }
             self.zero_meet_slots();
             let _ = self.wave_base();
         }
@@ -4350,10 +4492,103 @@ impl<'a> Lower<'a> {
     /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
+    /// Byte offset of scratch dword `dword` in this group's region.
+    fn scratch_byte(&mut self, block: usize, dword: V) -> V {
+        let base = self.scratch_base.expect("meshlet scratch base");
+        let four = self.s.m.i32(4);
+        let bytes = self.s.m.bin(block, Bin::Mul, dword, four);
+        self.s.m.bin(block, Bin::Add, base, bytes)
+    }
+
+    /// `atomicBinOp` on the scratch buffer. `op` is DXIL's code (add 0, exchange 8).
+    /// The result is the value that was there.
+    fn uav_atomic(&mut self, block: usize, op: u32, byte: V, value: V) -> V {
+        let h = self.scratch_uav.expect("meshlet scratch buffer");
+        let iu = self.s.m.undef(self.s.t.i32);
+        let code = self.s.m.i32(op);
+        self.s.op(
+            block,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            78,
+            &[h, code, byte, iu, iu, value],
+        )
+    }
+
+    /// One ticket for this group, broadcast through shared dword 0, which the
+    /// shader may use only after the barrier that follows the load.
+    fn take_scratch(&mut self) {
+        let h = self.s.root_uav_handle(super::shader::SLOT_MESHLET);
+        self.scratch_uav = Some(h);
+        let entry = self.s.entry;
+        let i32t = self.s.t.i32;
+        let flat = self.s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let zero = self.s.m.i32(0);
+        let first = self.s.m.cmp(entry, pred::EQ, flat, zero);
+        let (yes, no, mid) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(entry, Term::CondBr(first, yes, no));
+        let one = self.s.m.i32(1);
+        let ticket = self.uav_atomic(yes, 0, zero, one);
+        let lds = self.s.lds();
+        let slot0 = self.s.m.element(yes, lds, zero);
+        self.s.m.store(yes, slot0, ticket);
+        self.s.m.terminate(yes, Term::Br(mid));
+        self.s.m.terminate(no, Term::Br(mid));
+        self.group_sync(mid);
+        let slot0_mid = self.s.m.element(mid, lds, zero);
+        let loaded = self.s.m.load(mid, slot0_mid);
+        let groups = self.s.m.i32(super::shader::MESHLET_SCRATCH_GROUPS);
+        let which = self.s.m.bin(mid, Bin::URem, loaded, groups);
+        let stride = self.s.m.i32(super::shader::MESHLET_SCRATCH_STRIDE);
+        let region = self.s.m.bin(mid, Bin::Mul, which, stride);
+        let base_d = self.s.m.bin(mid, Bin::Add, region, one);
+        let four = self.s.m.i32(4);
+        self.scratch_base = Some(self.s.m.bin(mid, Bin::Mul, base_d, four));
+        self.s.entry = mid;
+    }
+
+    /// Zero this group's scratch, then one barrier, so the meets start at zero.
+    fn zero_scratch(&mut self) {
+        let entry = self.s.entry;
+        let i32t = self.s.t.i32;
+        let flat = self.s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let stride = self.s.m.i32(super::shader::MESHLET_SCRATCH_STRIDE);
+        let inside = self.s.m.cmp(entry, pred::IULT, flat, stride);
+        let (yes, no, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(entry, Term::CondBr(inside, yes, no));
+        let byte = self.scratch_byte(yes, flat);
+        let zero = self.s.m.i32(0);
+        let _ = self.uav_atomic(yes, 8, byte, zero);
+        self.s.m.terminate(yes, Term::Br(join));
+        self.s.m.terminate(no, Term::Br(join));
+        self.group_sync(join);
+        self.s.entry = join;
+    }
+
+    fn wave_base_uav(&mut self, slot: u32) -> Option<V> {
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let dword = self.s.m.i32(slot);
+        let byte = self.scratch_byte(e, dword);
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let zero = self.s.m.i32(0);
+        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        let k32 = self.s.m.i32(32);
+        let add = self.s.m.select(e, first, k32, zero);
+        let old = self.uav_atomic(e, 0, byte, add);
+        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        self.s.flags |= flags::WAVE_OPS;
+        self.wave_base = Some(base);
+        Some(base)
+    }
+
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
+        }
+        if self.exchange_uav {
+            return self.wave_base_uav(slot);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lds = self.s.lds();
@@ -4441,6 +4676,7 @@ impl<'a> Lower<'a> {
         let done = if self.wave_exchange && !everyone {
             if !self.both_halves(self.cur_ir) {
                 if self.meet_refuse.is_none() {
+                    need(self.cur_ir);
                     self.meet_refuse = Some(MESHLET_HALF);
                 }
                 block
@@ -4472,14 +4708,20 @@ impl<'a> Lower<'a> {
     /// The first lane of each half publishes the next count; the other half reads that dword
     /// until the count has reached this visit. A later visit of a loop does not reuse the count.
     fn half_meet_at(&mut self, block: usize) -> usize {
-        if self.meets >= self.meet_cap {
+        // One reused pair for meshlets: the halves take the same path, so the
+        // next visit is a higher count on the same dwords. The face shader
+        // gives every site its own pair.
+        let reuse = self.wave_exchange;
+        if (!reuse && self.meets >= self.meet_cap) || (reuse && self.meet_cap == 0) {
             if self.meet_refuse.is_none() {
                 self.meet_refuse = Some("more half-meets than the group memory holds");
             }
             return block;
         }
-        let site = self.meets;
-        self.meets += 1;
+        let site = if reuse { 0 } else { self.meets };
+        if !reuse {
+            self.meets += 1;
+        }
         #[cfg(test)]
         {
             self.half_meet_count += 1;
@@ -4512,9 +4754,14 @@ impl<'a> Lower<'a> {
         // so the publisher is the only writer of its dword.
         let (yes, no, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(block, Term::CondBr(first, yes, no));
-        let lds = self.s.lds();
-        let mine = self.s.m.element(yes, lds, index);
-        let old_yes = self.s.m.atomic(yes, Rmw::Add, mine, one);
+        let old_yes = if self.exchange_uav {
+            let byte = self.scratch_byte(yes, index);
+            self.uav_atomic(yes, 0, byte, one)
+        } else {
+            let lds = self.s.lds();
+            let mine = self.s.m.element(yes, lds, index);
+            self.s.m.atomic(yes, Rmw::Add, mine, one)
+        };
         self.s.m.terminate(yes, Term::Br(join));
         self.s.m.terminate(no, Term::Br(join));
         let i32t = self.s.t.i32;
@@ -4528,8 +4775,14 @@ impl<'a> Lower<'a> {
         let polls = self.s.m.phi(wait, i32t);
         let (lyes, lno, ljoin) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(wait, Term::CondBr(first, lyes, lno));
-        let theirs = self.s.m.element(lyes, lds, other);
-        let seen_yes = self.s.m.load_volatile(lyes, theirs);
+        let seen_yes = if self.exchange_uav {
+            let byte = self.scratch_byte(lyes, other);
+            self.uav_atomic(lyes, 0, byte, zero)
+        } else {
+            let lds = self.s.lds();
+            let theirs = self.s.m.element(lyes, lds, other);
+            self.s.m.load_volatile(lyes, theirs)
+        };
         self.s.m.terminate(lyes, Term::Br(ljoin));
         self.s.m.terminate(lno, Term::Br(ljoin));
         let seen_lane = self.s.m.phi(ljoin, i32t);
@@ -4541,12 +4794,14 @@ impl<'a> Lower<'a> {
         let start = self.s.m.i32(0);
         self.s.m.set_phi(polls, vec![(start, join), (polled, ljoin)]);
         self.cur = done;
-        let who = self.tally_lane(done);
-        let guarded = self.begin_guarded(Some(who));
-        let here = self.cur;
-        self.lds_tally(here, 0, one);
-        self.lds_tally(here, 1, polled);
-        self.end_guarded(guarded, &[]);
+        if !self.exchange_uav {
+            let who = self.tally_lane(done);
+            let guarded = self.begin_guarded(Some(who));
+            let here = self.cur;
+            self.lds_tally(here, 0, one);
+            self.lds_tally(here, 1, polled);
+            self.end_guarded(guarded, &[]);
+        }
         let after = self.cur;
         // The rest of this instruction was aimed at the block the meet closed.
         self.s.m.continues(block, after);
@@ -4602,6 +4857,10 @@ impl<'a> Lower<'a> {
 
     /// Zeroes the meet table. Every thread runs it, then one group barrier, before any meet.
     fn zero_meet_slots(&mut self) {
+        if self.exchange_uav {
+            self.zero_scratch();
+            return;
+        }
         if self.meet_cap == 0 {
             return;
         }
@@ -4654,18 +4913,30 @@ impl<'a> Lower<'a> {
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        if self.exchange_uav {
+            let byte = self.scratch_byte(at, index);
+            let _ = self.uav_atomic(at, 8, byte, mine);
+        } else {
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(at, lds, index);
+            self.s.m.store(at, ptr, mine);
+        }
         // A meshlet exchange waits for the other half of this console wave only.
         let everyone = !self.wave_exchange && self.reached_by_group();
         let at = self.order_waves(at, everyone);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let (lo, hi) = if self.exchange_uav {
+            let b0 = self.scratch_byte(at, pair);
+            let b1 = self.scratch_byte(at, k1);
+            let zero = self.s.m.i32(0);
+            (self.uav_atomic(at, 0, b0, zero), self.uav_atomic(at, 0, b1, zero))
+        } else {
+            let lds = self.s.lds();
+            let p0 = self.s.m.element(at, lds, pair);
+            let p1 = self.s.m.element(at, lds, k1);
+            (self.s.m.load(at, p0), self.s.m.load(at, p1))
+        };
         // the slots are written again only after every thread read them
         let _at = self.order_waves(at, everyone);
         (lo, hi)
@@ -5823,6 +6094,23 @@ impl<'a> Lower<'a> {
             if self.half_meet {
                 self.lds_run = Some(write);
             }
+        }
+        // Meshlets: the same per-wave meet, only where both halves run and the
+        // other console waves do not. A group barrier here would wait for a
+        // wave that took the other side. Consecutive reads share one meet.
+        if !self.split_lds
+            && self.wave_exchange
+            && matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            && !self.reached_by_group()
+            && self.both_halves(self.cur_ir)
+        {
+            let write = !name.starts_with("ds_read");
+            let owed = write || self.lds_run != Some(false);
+            if owed {
+                self.cur = self.order_waves(self.cur, false);
+            }
+            self.lds_run = Some(write);
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -13379,6 +13667,10 @@ mod tests {
     }
 
     fn meshlet_program(threads: u32, words: &[u32]) -> NativeProgram {
+        meshlet_program_lds(threads, words, 512)
+    }
+
+    fn meshlet_program_lds(threads: u32, words: &[u32], lds_bytes: u32) -> NativeProgram {
         let code: Vec<u8> = words.iter().copied().flat_map(u32::to_le_bytes).collect();
         NativeProgram {
             stage: HwStage::Cs,
@@ -13394,7 +13686,7 @@ mod tests {
             }],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 1 << 15 | 2 << 1,
+                rsrc2: (lds_bytes / 512) << 15 | 2 << 1,
                 threads: [threads, 1, 1],
             }),
             code,
@@ -13404,7 +13696,7 @@ mod tests {
     /// Sixteen console waves. A divergent LDS read and write is not ordered by
     /// an exchange inside one wave, so the program is refused by name.
     #[test]
-    fn meshlet_divergent_lds_is_refused() {
+    fn meshlet_divergent_lds_meets_per_wave() {
         let words = [
             0x7E02_0281, // v_mov_b32 v1, 1
             0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
@@ -13423,6 +13715,214 @@ mod tests {
         let err = super::meshlet_exchange(&p, &st).unwrap_err();
         assert_eq!(err, super::MESHLET_LDS_REGION);
         assert!(!err.ends_with("where not every lane runs"));
+        let branches = super::meshlet_lds_branches(&p, &st).expect("the exec branch is wave-wide");
+        assert_eq!(branches.len(), 1);
+        let wide: std::collections::HashSet<usize> = branches.into_iter().collect();
+        let st = structure::structure_wide(&p, &wide).unwrap();
+        super::meshlet_exchange(&p, &st).expect("both halves now run the LDS pair");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lds_blocks: Vec<usize> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.insts.iter().any(|i| i.name() == "ds_write_b32" || i.name() == "ds_read_b32")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = super::with_wave_exchange(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("wave 32 with a per-wave meet");
+        assert_eq!(lowered.wave_size, Some(32));
+        assert!(lowered.half_meets >= 1, "the two halves did not meet");
+        for b in &lds_blocks {
+            assert!(
+                !lowered.group_sync_blocks.contains(b),
+                "a group barrier landed inside the divergent LDS block {b}"
+            );
+        }
+    }
+
+    /// A first-lane read inside `s_cbranch_execz` is refused until that branch
+    /// is taken by both halves. Then the halves meet, and the block does not
+    /// get a group barrier.
+    #[test]
+    fn meshlet_exec_exchange_meets_per_wave() {
+        let words = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0004, // s_cbranch_execz past the first-lane read and its store
+            0x7E0A_0501, // v_readfirstlane_b32 s5, v1
+            0x7E04_0205, // v_mov_b32 v2, s5
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 2,
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let native = meshlet_program(1024, &words);
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let plain = super::with_wave_exchange(|| lower(&parts));
+        super::TEST_HOST_WAVE.set(was);
+        let Err(err) = plain else {
+            panic!("one half does not run the exchange");
+        };
+        let crate::ShaderError::Unsupported { what, .. } = &err else {
+            panic!("unexpected {err}");
+        };
+        assert!(
+            *what == super::MESHLET_HALF || what.ends_with("where not every lane runs"),
+            "unexpected refusal: {what}"
+        );
+        let needs = super::take_needs();
+        assert!(!needs.is_empty(), "the block was not noted");
+        let branches = super::branches_around(&st, &needs).expect("the exec branch is wave-wide");
+        assert!(!branches.is_empty());
+        let wide: std::collections::HashSet<usize> = branches.into_iter().collect();
+        let st = structure::structure_wide(&p, &wide).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let exchange = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32"))
+            .expect("the first-lane read");
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = super::with_wave_exchange(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("wave 32 once both halves run the exchange");
+        assert_eq!(lowered.wave_size, Some(32));
+        assert!(lowered.half_meets >= 1, "the two halves did not meet");
+        assert!(
+            !lowered.group_sync_blocks.contains(&exchange),
+            "a group barrier landed inside the exchange block {exchange}"
+        );
+    }
+
+    /// The real meshlet group already fills the host's 32 KiB, so the exchange
+    /// cannot sit past it. Opening the branch still emits wave 32, and the
+    /// meet stays inside the wave.
+    #[test]
+    fn meshlet_exchange_when_group_memory_is_full() {
+        let words = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0004, // s_cbranch_execz past the first-lane read and its store
+            0x7E0A_0501, // v_readfirstlane_b32 s5, v1
+            0x7E04_0205, // v_mov_b32 v2, s5
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 2,
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let native = meshlet_program_lds(1024, &words, 32768);
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let plain = super::with_wave_exchange(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let Err(err) = plain else {
+            panic!("one half does not run the exchange");
+        };
+        let crate::ShaderError::Unsupported { what, .. } = &err else {
+            panic!("unexpected {err}");
+        };
+        assert!(
+            *what == super::MESHLET_HALF || what.ends_with("where not every lane runs"),
+            "unexpected refusal: {what}"
+        );
+        assert_ne!(*what, "more half-meets than the group memory holds");
+        let needs = super::take_needs();
+        let branches = super::branches_around(&st, &needs).expect("the exec branch is wave-wide");
+        let wide: std::collections::HashSet<usize> = branches.into_iter().collect();
+        let st = structure::structure_wide(&p, &wide).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let exchange = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32"))
+            .expect("the first-lane read");
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = super::with_wave_exchange(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("wave 32 with the scratch buffer");
+        assert_eq!(lowered.wave_size, Some(32));
+        assert!(lowered.half_meets >= 1, "the two halves did not meet");
+        assert!(
+            !lowered.group_sync_blocks.contains(&exchange),
+            "a group barrier landed inside the exchange block {exchange}"
+        );
     }
 
     /// An `s_barrier` inside a lane branch does not arrive for every thread.
