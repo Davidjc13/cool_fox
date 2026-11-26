@@ -589,15 +589,24 @@ pub fn emit(
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
         // of the group does not wait (`with_half_meets`). Not the global switch.
-        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
-        // are dropped and a run can be compared with one where it executes.
+        // Two containers of that compute take this path. `VICTORY_DEFRAG=0`
+        // leaves both untranslated, so their dispatches are dropped and a run
+        // can be compared with one where they execute.
         let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
         let defrag = !defrag_off
-            && c.digest
-                == [
+            && matches!(
+                c.digest,
+                [
                     0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
                     0xa1, 0x23, 0xc6,
-                ];
+                ]
+                    // 02384a60fda6f2d0
+                    | [
+                        0x38, 0x46, 0xe6, 0x94, 0xcd, 0xe8, 0x37, 0x97, 0x51, 0x00, 0xf6, 0x5b,
+                        0x4c, 0xa3, 0xd8, 0xcb,
+                    ]
+                // 22338086ea4c5364
+            );
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
