@@ -450,6 +450,17 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5): 1024 threads, sixteen
+    // console waves. Exchanges stay inside each wave. This does not widen
+    // branches and does not use the face shader's half-meet flag.
+    let meshlets = c.digest == MESHLETS
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 1024);
+    if meshlets {
+        return meshlet_emit(c, native, p, st, io, res);
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -825,6 +836,43 @@ fn widen(
             }
         }
         wide.extend(more);
+    }
+}
+
+/// `CS_CollectTriangles_Meshlets`. Container bytes 4..20.
+const MESHLETS: [u8; 16] = [
+    0xb8, 0x5d, 0x78, 0xdd, 0x26, 0xe6, 0x96, 0x3e, 0x95, 0xfa, 0x09, 0xcd, 0xf5, 0x59, 0x6d, 0xb6,
+];
+
+/// Wave 32 for meshlets when every cross-lane value can be exchanged inside
+/// its console wave. Anything that would wait for another wave, or for a
+/// half that does not run the block, is a named refusal. The program never
+/// comes out still asking for wave 64.
+fn meshlet_emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if let Err(what) = lower::meshlet_exchange(p, st) {
+        return Err(ShaderError::Unsupported { offset: 0, what });
+    }
+    let again = lower::with_wave_exchange(|| emit_program(c, native, p, st, io, res));
+    match again {
+        Ok((shader, wave)) if wave != Some(64) => Ok(shader),
+        Ok(_) => Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "meshlet exchanges did not reach wave 32",
+        }),
+        Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what) => {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: lower::MESHLET_HALF,
+            })
+        }
+        Err(e) => Err(e),
     }
 }
 

@@ -400,6 +400,9 @@ struct Lower<'a> {
     abort: Option<usize>,
     /// This shader meets the two halves of each console wave on their own.
     half_meet: bool,
+    /// Meshlets: the same per-wave meet, for an exchange of the two halves only.
+    /// Shader LDS is not ordered this way, and the face-shader counters stay put.
+    wave_exchange: bool,
     /// First LDS dword of the per-wave meet table, and how many sites fit.
     meet_base: u32,
     meet_cap: u32,
@@ -1141,6 +1144,8 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_half_meets`].
     static HALF_MEETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_wave_exchange`].
+    static WAVE_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The host's group-shared memory, in dwords (32 KiB).
@@ -1157,6 +1162,54 @@ pub(super) fn with_half_meets<R>(f: impl FnOnce() -> R) -> R {
 
 pub(super) fn half_meets() -> bool {
     HALF_MEETS.get()
+}
+
+/// An LDS read and a write share one region that not every lane runs, in a
+/// group of several console waves. A group barrier there waits for threads
+/// that never arrive, and a per-wave meet is not this lowering.
+pub(super) const MESHLET_LDS_REGION: &str =
+    "an LDS read and write in one lane region of several console waves";
+
+/// An `s_barrier` stands where not every thread of the group arrives.
+pub(super) const MESHLET_BARRIER: &str = "a group barrier not every thread of the group reaches";
+
+/// The control-flow graph has an indirect exit, so reach cannot be named.
+pub(super) const MESHLET_INDIRECT: &str = "an indirect exit in a group of several console waves";
+
+/// An exchange of the two halves would wait in a block one half does not run.
+pub(super) const MESHLET_HALF: &str = "a meshlet exchange where one half does not run";
+
+/// Whether this program can drop to wave 32 by exchanging inside each console
+/// wave only. Shared memory the console already orders with a group barrier
+/// stays. A new barrier, or a meet the other waves would have to join, is refused.
+pub(super) fn meshlet_exchange(p: &Program, st: &Structured) -> Result<(), &'static str> {
+    let Some(all) = all_lane_blocks(st) else {
+        return Err(MESHLET_INDIRECT);
+    };
+    let Some(group) = every_thread_blocks(st) else {
+        return Err(MESHLET_INDIRECT);
+    };
+    // The same refusal as [`lds_meetings`]: a read and a write with no
+    // all-lane block between them. A commuting reduction is not one of these.
+    if lds_meetings(p, st, &all).is_none() {
+        return Err(MESHLET_LDS_REGION);
+    }
+    for (b, blk) in p.blocks.iter().enumerate() {
+        if blk.insts.iter().any(|i| i.name() == "s_barrier") && !group.get(b).copied().unwrap_or(false) {
+            return Err(MESHLET_BARRIER);
+        }
+    }
+    Ok(())
+}
+
+/// Runs `f` while each console wave exchanges its two host halves on its own
+/// dwords. The other waves of the group do not wait, and no group barrier is
+/// added in front of an LDS access.
+pub(super) fn with_wave_exchange<R>(f: impl FnOnce() -> R) -> R {
+    let was = WAVE_EXCHANGE.replace(true);
+    let r = f();
+    WAVE_EXCHANGE.set(was);
+    r
 }
 
 /// Meet sites emitted for the face-relocation compute, one number for the whole process.
@@ -1574,7 +1627,18 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                // Meshlets: exchange inside each console wave, and do not put a
+                // group barrier in front of every LDS access. The caller has
+                // already refused a pattern this cannot order.
+                if WAVE_EXCHANGE.get() {
+                    let all = all_lane_blocks(x.st).unwrap_or_default();
+                    wave = 32;
+                    split_lds = false;
+                    if crosses {
+                        exchange = Some((s.lds_dwords, group <= 32, all));
+                        s.lds_dwords += 2 * group.div_ceil(64);
+                    }
+                } else if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
                     // (Groups of several console waves too: each console wave is two host
@@ -1670,7 +1734,8 @@ impl<'a> Lower<'a> {
         // Room for one dword pair per console wave per meet, behind the program's LDS.
         // A site that does not fit is refused rather than declared past the host's 32 KiB.
         let half_meet = HALF_MEETS.get() && s.wave_size == Some(32);
-        let (meet_base, meet_cap, meet_waves, meet_tally, wave_all, group_all) = if half_meet {
+        let wave_exchange = WAVE_EXCHANGE.get() && s.wave_size == Some(32) && !half_meet;
+        let (meet_base, meet_cap, meet_waves, meet_tally, wave_all, group_all) = if half_meet || wave_exchange {
             let group = s.threads.map(|t| t.into_iter().product::<u32>()).unwrap_or(0);
             let waves = group.div_ceil(64).max(1);
             // Three dwords past the table count meetings, wait polls and wait atomics.
@@ -1889,6 +1954,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             half_meet,
+            wave_exchange,
             meet_base,
             meet_cap,
             meet_waves,
@@ -2498,10 +2564,12 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        if self.half_meet {
+        if self.half_meet || self.wave_exchange {
             // The meet slots start at zero, then the wave counter, both before any thread leaves.
             self.zero_meet_slots();
             let _ = self.wave_base();
+        }
+        if self.half_meet {
             self.meet_uav = Some(self.s.root_uav_handle(super::shader::SLOT_MEET));
         }
         if counted {
@@ -4368,7 +4436,18 @@ impl<'a> Lower<'a> {
     fn order_waves(&mut self, block: usize, everyone: bool) -> usize {
         // A meet or a group barrier ends a run of reads: the next access orders again.
         self.lds_run = None;
-        let done = if !self.half_meet || everyone {
+        // Meshlets exchange inside one console wave. The other waves do not wait.
+        // A meet in a block one half skips is refused, not turned into a group barrier.
+        let done = if self.wave_exchange && !everyone {
+            if !self.both_halves(self.cur_ir) {
+                if self.meet_refuse.is_none() {
+                    self.meet_refuse = Some(MESHLET_HALF);
+                }
+                block
+            } else {
+                self.half_meet_at(block)
+            }
+        } else if !self.half_meet || everyone {
             #[cfg(test)]
             self.group_sync_blocks.push(self.cur_ir);
             self.group_sync(block);
@@ -4578,7 +4657,9 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        let at = self.order_waves(at, self.reached_by_group());
+        // A meshlet exchange waits for the other half of this console wave only.
+        let everyone = !self.wave_exchange && self.reached_by_group();
+        let at = self.order_waves(at, everyone);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -4586,7 +4667,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        let _at = self.order_waves(at, self.reached_by_group());
+        let _at = self.order_waves(at, everyone);
         (lo, hi)
     }
 
@@ -13295,6 +13376,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn meshlet_program(threads: u32, words: &[u32]) -> NativeProgram {
+        let code: Vec<u8> = words.iter().copied().flat_map(u32::to_le_bytes).collect();
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code,
+        }
+    }
+
+    /// Sixteen console waves. A divergent LDS read and write is not ordered by
+    /// an exchange inside one wave, so the program is refused by name.
+    #[test]
+    fn meshlet_divergent_lds_is_refused() {
+        let words = [
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0004, // s_cbranch_execz past the LDS pair
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 1,
+            0x36 << 26 | 0x36 << 18, // ds_read_b32
+            2 << 24 | 1,
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let native = meshlet_program(1024, &words);
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let err = super::meshlet_exchange(&p, &st).unwrap_err();
+        assert_eq!(err, super::MESHLET_LDS_REGION);
+        assert!(!err.ends_with("where not every lane runs"));
+    }
+
+    /// An `s_barrier` inside a lane branch does not arrive for every thread.
+    #[test]
+    fn meshlet_divergent_barrier_is_refused() {
+        let words = [
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let native = meshlet_program(1024, &words);
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let err = super::meshlet_exchange(&p, &st).unwrap_err();
+        assert_eq!(err, super::MESHLET_BARRIER);
+        assert!(!err.ends_with("where not every lane runs"));
+    }
+
+    /// A straight-line group barrier and an in-wave count lower to wave 32.
+    /// The halves exchange on their own; the face-shader meet counter stays at zero.
+    #[test]
+    fn meshlet_exchange_lowers_a_group_barrier() {
+        let words = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 1,
+            0xBF8A_0000, // s_barrier
+            S_ENDPGM,
+        ];
+        let native = meshlet_program(1024, &words);
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        super::meshlet_exchange(&p, &st).expect("straight-line LDS is in every lane");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = super::with_wave_exchange(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("wave 32 by an in-wave exchange");
+        assert_eq!(lowered.wave_size, Some(32));
+        assert_eq!(lowered.half_meets, 0, "a face-shader meet was counted");
+        assert!(lowered.group_barriers >= 1, "the console barrier was dropped");
     }
 
     /// A minimum and then an add on one LDS word are not interchangeable
