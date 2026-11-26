@@ -234,7 +234,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     }
     if rt_store_trace {
-        child.env("VICTORY_CAPTURE_RAW_STORES", victory_shader::emit::RAW_STORE_PROBE_HASH);
+        child.env("VICTORY_CAPTURE_RAW_STORES", "3cea4534bbc15632");
         writeln!(log, "InitHeaders store trace requested")?;
     }
     if lighting_trace {
