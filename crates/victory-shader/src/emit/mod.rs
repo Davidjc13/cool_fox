@@ -451,12 +451,12 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5): 1024 threads, sixteen
-    // console waves. Exchanges stay inside each wave. A shared-memory read
-    // and write that not every lane runs is taken by the whole wave, then
-    // the two halves meet. This does not call `widen` and does not use the
-    // face shader's half-meet flag.
-    let meshlets = c.digest == MESHLETS
+    // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5) and CS_CollectTriangles
+    // (6832a9da15c2e584): 1024 threads, sixteen console waves. Exchanges stay
+    // inside each wave. A shared-memory read and write that not every lane
+    // runs is taken by the whole wave, then the two halves meet. This does
+    // not call `widen` and does not use the face shader's half-meet flag.
+    let meshlets = matches!(c.digest, MESHLETS | COLLECT)
         && native.stage == HwStage::Cs
         && native.wave64
         && lower::host_max_wave() == 32
@@ -854,6 +854,12 @@ fn widen(
 /// `CS_CollectTriangles_Meshlets`. Container bytes 4..20.
 const MESHLETS: [u8; 16] = [
     0xb8, 0x5d, 0x78, 0xdd, 0x26, 0xe6, 0x96, 0x3e, 0x95, 0xfa, 0x09, 0xcd, 0xf5, 0x59, 0x6d, 0xb6,
+];
+
+/// `CS_CollectTriangles`. Container bytes 4..20. Same group and the same
+/// shared-memory shape as [`MESHLETS`], so it takes that path.
+const COLLECT: [u8; 16] = [
+    0xf4, 0xb4, 0xb3, 0xfb, 0x31, 0xf3, 0x34, 0x55, 0xb3, 0x39, 0x1c, 0x37, 0x74, 0x10, 0x84, 0x8b,
 ];
 
 /// Wave 32 for meshlets when every cross-lane value can be exchanged inside
