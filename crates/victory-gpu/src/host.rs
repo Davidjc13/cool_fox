@@ -843,6 +843,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // PIX's capture library, before the device (`VICTORY_PIX_CAPTURE`).
+    #[cfg(feature = "diagnostics")]
+    crate::capture::pix_load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
