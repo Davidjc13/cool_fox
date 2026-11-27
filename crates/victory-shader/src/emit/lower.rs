@@ -1222,12 +1222,163 @@ pub(super) fn meshlet_exchange(p: &Program, st: &Structured) -> Result<(), &'sta
     if lds_meetings(p, st, &all).is_none() {
         return Err(MESHLET_LDS_REGION);
     }
+    let same = lane_uniform(p, st, &all, true);
+    let tainted = thread_id_values(p);
     for (b, blk) in p.blocks.iter().enumerate() {
-        if blk.insts.iter().any(|i| i.name() == "s_barrier") && !group.get(b).copied().unwrap_or(false) {
-            return Err(MESHLET_BARRIER);
+        if !blk.insts.iter().any(|i| i.name() == "s_barrier") {
+            continue;
         }
+        if group.get(b).copied().unwrap_or(false) || barrier_group_uniform(st, &same, &tainted, b) {
+            continue;
+        }
+        return Err(MESHLET_BARRIER);
     }
     Ok(())
+}
+
+/// Values that differ from one thread to the next: the group's thread ids,
+/// a lane index, and anything computed from those. A scalar copied into a
+/// VGPR is not one of these. Scalars are per wave on the console, and a
+/// branch on a scalar is already taken as the whole group's.
+fn thread_id_values(p: &Program) -> HashSet<Value> {
+    let mut bad: HashSet<Value> = p
+        .inputs
+        .iter()
+        .filter(|(reg, _)| matches!(reg, Reg::V(_)))
+        .map(|(_, v)| *v)
+        .collect();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if phi.args.iter().any(|a| bad.contains(a)) && bad.insert(phi.value) {
+                    grew = true;
+                }
+            }
+            for inst in &block.insts {
+                let name = inst.name();
+                let carried = name.starts_with("v_mbcnt")
+                    || name.contains("lane")
+                    || flow_sources(inst).iter().any(|v| bad.contains(v));
+                if carried {
+                    for (_, v) in &inst.writes {
+                        if bad.insert(*v) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// Operands that flow into an instruction's result. The old value of a
+/// VGPR destination, kept for lanes outside EXEC, is not one of them.
+fn flow_sources(inst: &Inst) -> Vec<Value> {
+    let mut ops: Vec<&Operand> = Vec::new();
+    match &inst.fields {
+        Fields::Valu(v) => ops.extend(v.src.iter()),
+        Fields::Sop { src, .. } => ops.extend(src.iter()),
+        Fields::Ds { addr, data, .. } => {
+            ops.extend(addr.iter());
+            ops.extend(data.iter());
+        }
+        Fields::Smem { base, soffset, .. } => {
+            ops.push(base);
+            ops.push(soffset);
+        }
+        Fields::Buffer { addr, rsrc, soffset, .. } => {
+            ops.push(addr);
+            ops.push(rsrc);
+            ops.push(soffset);
+        }
+        Fields::Flat { addr, data, saddr, .. } => {
+            ops.extend(addr.iter());
+            ops.extend(data.iter());
+            ops.extend(saddr.iter());
+        }
+        _ => {}
+    }
+    ops.into_iter().flat_map(|op| operand_values(inst, op)).collect()
+}
+
+fn operand_values(inst: &Inst, op: &Operand) -> Vec<Value> {
+    match *op {
+        Operand::Vector { reg, dwords } => (0..dwords).filter_map(|d| inst.read(Reg::V(reg + d))).collect(),
+        Operand::Scalar { code, dwords } if code < 106 => {
+            (0..dwords).filter_map(|d| inst.read(Reg::S(code + d))).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A barrier inside a branch every thread of the group takes the same way.
+/// The condition is a scalar, or a value that is the same in every lane and
+/// does not come from a thread id. A read of one shared-memory address is
+/// that value for every wave. The host can keep the group barrier: either
+/// every thread reaches it, or none does.
+fn barrier_group_uniform(st: &Structured, same: &HashSet<Value>, tainted: &HashSet<Value>, block: usize) -> bool {
+    let Some(regions) = control_regions(st, false) else {
+        return false;
+    };
+    let mut saw = false;
+    for (d, region) in regions {
+        if !region.get(block).copied().unwrap_or(false) {
+            continue;
+        }
+        saw = true;
+        let LaneExit::Branch { when, .. } = st.exits[d] else {
+            return false;
+        };
+        let ok = st.bools.support(when).iter().all(|atom| match *atom {
+            Atom::Uniform(v) => !tainted.contains(&v),
+            Atom::Lane(v) | Atom::Phi(v) => same.contains(&v) && !tainted.contains(&v),
+            _ => false,
+        });
+        if !ok {
+            return false;
+        }
+    }
+    saw
+}
+
+/// Per-lane branches around an `s_barrier` that is not yet the whole group's.
+/// Opening one ([`crate::structure::structure_wide`]) lets a later pass see
+/// whether the condition is the same in every wave. A branch with no
+/// wave-wide meaning is [`MESHLET_WAVE`]. A barrier with no such branch stays
+/// [`MESHLET_BARRIER`].
+pub(super) fn meshlet_barrier_branches(p: &Program, st: &Structured) -> Result<Vec<usize>, &'static str> {
+    let Some(all) = all_lane_blocks(st) else {
+        return Err(MESHLET_INDIRECT);
+    };
+    let Some(group) = every_thread_blocks(st) else {
+        return Err(MESHLET_INDIRECT);
+    };
+    let same = lane_uniform(p, st, &all, true);
+    let tainted = thread_id_values(p);
+    let blocks: Vec<usize> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, blk)| {
+            blk.insts.iter().any(|i| i.name() == "s_barrier")
+                && !group.get(*b).copied().unwrap_or(false)
+                && !barrier_group_uniform(st, &same, &tainted, *b)
+        })
+        .map(|(b, _)| b)
+        .collect();
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(branches) = branches_around(st, &blocks) else {
+        return Err(MESHLET_WAVE);
+    };
+    if branches.is_empty() {
+        return Err(MESHLET_BARRIER);
+    }
+    Ok(branches)
 }
 
 /// Blocks of a not-all-lane region that both reads and writes LDS, unless
