@@ -453,8 +453,9 @@ pub fn emit(
     lower::take_needs();
     // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5) and CS_CollectTriangles
     // (6832a9da15c2e584): 1024 threads, sixteen console waves. The decal
-    // vertex buffer (1d434307d981352a) is the same exchange on a group of
-    // 512: eight waves, and its barriers are one shared-memory word compared
+    // vertex buffer (1d434307d981352a) and the projection boxes
+    // (3b02415f67c6b0d8) are the same exchange on a group of
+    // 512: eight waves, and their barriers are one shared-memory word compared
     // with a constant. Exchanges stay inside each wave. A shared-memory read
     // and write that not every lane runs is taken by the whole wave, then
     // the two halves meet. This does not call `widen` and does not use the
@@ -468,7 +469,7 @@ pub fn emit(
         && lower::host_max_wave() == 32
         && match group {
             1024 => matches!(c.digest, MESHLETS | COLLECT),
-            512 => c.digest == DECAL_NODES,
+            512 => matches!(c.digest, DECAL_NODES | DECAL_BOXES),
             _ => false,
         };
     if meshlets {
@@ -891,6 +892,12 @@ const COLLECT: [u8; 16] = [
 /// group takes them together.
 const DECAL_NODES: [u8; 16] = [
     0x76, 0x89, 0x2e, 0x3e, 0x72, 0xc3, 0x2c, 0x65, 0x00, 0x24, 0x11, 0xc5, 0x53, 0x84, 0x09, 0x28,
+];
+
+/// `CS_BuildProjDecalTrailProjectionBoxInstances`. Container bytes 4..20.
+/// Same group of 512 and the same kind of barrier as [`DECAL_NODES`].
+const DECAL_BOXES: [u8; 16] = [
+    0x2c, 0xdc, 0x63, 0xc7, 0xd2, 0x2a, 0x4d, 0x1e, 0x2a, 0xc4, 0xb3, 0xf5, 0x78, 0xd0, 0x18, 0xe4,
 ];
 
 /// Wave 32 for meshlets when every cross-lane value can be exchanged inside
