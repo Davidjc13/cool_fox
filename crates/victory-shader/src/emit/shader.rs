@@ -64,6 +64,23 @@ pub const SLOT_FAULTS: u8 = 253;
 /// Root UAV `u<SLOT_MEET>`: three dwords the face-relocation compute adds to,
 /// meetings, wait iterations and wait atomics. Ours, not the title's.
 pub const SLOT_MEET: u8 = 252;
+/// Root UAV `u<SLOT_MESHLET>`: scratch for a meshlet exchange when the
+/// group's own shared memory already fills the host's 32 KiB. Dword 0 is a
+/// ticket. Each group then owns [`MESHLET_SCRATCH_STRIDE`] dwords. Ours.
+pub const SLOT_MESHLET: u8 = 251;
+/// Groups the meshlet scratch can hold at once. A 1024-thread group takes
+/// the whole 32 KiB of shared memory, so only a few hundred fit on the GPU.
+pub(super) const MESHLET_SCRATCH_GROUPS: u32 = 16384;
+/// Console waves a 1024-thread group splits into on a 64-lane console.
+pub(super) const MESHLET_SCRATCH_WAVES: u32 = 16;
+/// Dwords of one group's scratch: an exchange pair and a meet pair per
+/// console wave, then the wave counter. The ticket dword is not in here.
+pub(super) const MESHLET_SCRATCH_STRIDE: u32 = 4 * MESHLET_SCRATCH_WAVES + 1;
+
+/// Bytes of [`SLOT_MESHLET`], the ticket dword included.
+pub fn meshlet_scratch_bytes() -> u64 {
+    4 * u64::from(1 + MESHLET_SCRATCH_GROUPS * MESHLET_SCRATCH_STRIDE)
+}
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address

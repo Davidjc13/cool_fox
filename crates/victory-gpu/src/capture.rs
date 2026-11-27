@@ -8,6 +8,73 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// A PIX GPU capture taken by the run itself (diagnostics builds), without
+/// the PIX window: `VICTORY_PIX_CAPTURE=<file.wpix>` loads PIX's capture
+/// library before the device is made (`VICTORY_PIX_DLL`, else PIX 2611.19's),
+/// and at the present of frame `VICTORY_PIX_FRAME` (default 3600) asks it for
+/// a capture of the next `VICTORY_PIX_FRAMES` frames (default 3).
+#[cfg(feature = "diagnostics")]
+fn pix_file() -> Option<&'static Vec<u16>> {
+    static FILE: std::sync::OnceLock<Option<Vec<u16>>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        std::env::var("VICTORY_PIX_CAPTURE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.encode_utf16().chain([0]).collect())
+    })
+    .as_ref()
+}
+
+/// Loads PIX's capture library (see [`pix_file`]); before the device.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pix_load() {
+    if pix_file().is_none() {
+        return;
+    }
+    let dll = std::env::var("VICTORY_PIX_DLL")
+        .unwrap_or_else(|_| r"C:\Program Files\Microsoft PIX\2611.19\WinPixGpuCapturer.dll".to_owned());
+    let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated path.
+    let module = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
+    if module.is_null() {
+        tracing::warn!(dll, "PIX capture library not loaded");
+    } else {
+        tracing::info!(dll, "PIX capture library loaded");
+    }
+}
+
+/// At the present of `frame`: asks PIX for the capture (see [`pix_file`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pix_at_present(frame: u64) {
+    let Some(file) = pix_file() else { return };
+    let number = |name: &str, default: u64| {
+        std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    };
+    static AT: std::sync::OnceLock<(u64, u32)> = std::sync::OnceLock::new();
+    let (at, frames) = *AT.get_or_init(|| (number("VICTORY_PIX_FRAME", 3600), number("VICTORY_PIX_FRAMES", 3) as u32));
+    if frame != at {
+        return;
+    }
+    let name: Vec<u16> = "WinPixGpuCapturer.dll".encode_utf16().chain([0]).collect();
+    // SAFETY: NUL-terminated names; the export has the signature pix3.h
+    // gives it: HRESULT PIXGpuCaptureNextFrames(PCWSTR fileName, UINT32 numFrames).
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            tracing::warn!(frame, "PIX capture library not loaded: no capture");
+            return;
+        }
+        let Some(proc) = GetProcAddress(module, c"CaptureNextFrame".as_ptr().cast()) else {
+            tracing::warn!(frame, "CaptureNextFrame not found in PIX's library: no capture");
+            return;
+        };
+        let capture: unsafe extern "system" fn(*const u16, u32) -> i32 = std::mem::transmute(proc);
+        let hr = capture(file.as_ptr(), frames);
+        tracing::warn!(frame, frames, hr = format_args!("{hr:#x}"), "PIX capture asked for");
+    }
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -383,7 +450,12 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || !matches!(
+                d.Dimension,
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            )
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -441,6 +513,23 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
+        // A 3D texture (the title's color-grading tables, 33x33x33) or a 1D
+        // one (its tone curves, 4096x1): the first level's bytes as they
+        // are, rows `pitch` apart, slices `pitch * height` apart, to compare
+        // values between runs.
+        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            if let Some(folder) = folder() {
+                let len = pitch * f.Height as usize * f.Depth as usize;
+                let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len);
+                let name = format!(
+                    "frame-{frame}-{i:02}-{resource:?}-{}x{}x{}-f{}-p{pitch}.bin",
+                    f.Width, f.Height, f.Depth, f.Format.0
+                );
+                let _ = std::fs::write(folder.join(name), bytes);
+            }
+            buffer.Unmap(0, None);
+            return;
+        }
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.

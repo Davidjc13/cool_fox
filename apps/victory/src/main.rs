@@ -98,7 +98,9 @@ enum Command {
     },
     /// Translate every shader found (as `translate` finds them) into the
     /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// of the translator. Set `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT`
+    /// to what the run's log says of the host (32 and 999999 on an RTX
+    /// card), or the run finds nothing it can use.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
@@ -213,7 +215,18 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs } => {
+            // As for `translate --warm`: the cache keys hold the host's settings, so a cache
+            // for a card whose heap or waves differ is filled only with them set
+            // (`VICTORY_VIEW_LIMIT=999999 VICTORY_HOST_WAVE=32` on an RTX card).
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::precompile(paths, jobs)
+        }
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

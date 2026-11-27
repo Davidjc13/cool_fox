@@ -121,7 +121,8 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MESHLET, SLOT_MEMORY, SLOT_STRIDES,
+    meshlet_scratch_bytes,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -450,6 +451,30 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // CS_CollectTriangles_Meshlets (6b82bc7d22016cb5) and CS_CollectTriangles
+    // (6832a9da15c2e584): 1024 threads, sixteen console waves. The decal
+    // vertex buffer (1d434307d981352a) and the projection boxes
+    // (3b02415f67c6b0d8) are the same exchange on a group of
+    // 512: eight waves, and their barriers are one shared-memory word compared
+    // with a constant. Exchanges stay inside each wave. A shared-memory read
+    // and write that not every lane runs is taken by the whole wave, then
+    // the two halves meet. This does not call `widen` and does not use the
+    // face shader's half-meet flag.
+    let group = match native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => 0,
+    };
+    let meshlets = native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && match group {
+            1024 => matches!(c.digest, MESHLETS | COLLECT),
+            512 => matches!(c.digest, DECAL_NODES | DECAL_BOXES),
+            _ => false,
+        };
+    if meshlets {
+        return meshlet_emit(c, native, p, st, io, res);
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -575,15 +600,24 @@ pub fn emit(
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
         // of the group does not wait (`with_half_meets`). Not the global switch.
-        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
-        // are dropped and a run can be compared with one where it executes.
+        // Two containers of that compute take this path. `VICTORY_DEFRAG=0`
+        // leaves both untranslated, so their dispatches are dropped and a run
+        // can be compared with one where they execute.
         let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
         let defrag = !defrag_off
-            && c.digest
-                == [
+            && matches!(
+                c.digest,
+                [
                     0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
                     0xa1, 0x23, 0xc6,
-                ];
+                ]
+                    // 02384a60fda6f2d0
+                    | [
+                        0x38, 0x46, 0xe6, 0x94, 0xcd, 0xe8, 0x37, 0x97, 0x51, 0x00, 0xf6, 0x5b,
+                        0x4c, 0xa3, 0xd8, 0xcb,
+                    ]
+                // 22338086ea4c5364
+            );
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -691,6 +725,20 @@ pub fn emit(
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
+            }
+        }
+        // A wave64 program still asking for 64-lane waves on a 32-lane host (NVIDIA): the
+        // branches around what needs every lane (wave reductions, LDS where lanes branch
+        // apart) taken wave-wide, as the console runs them, may let it run in halves.
+        Ok((shader, Some(64)))
+            if native.stage == HwStage::Cs
+                && native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+        {
+            match widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false) {
+                Ok((s, w)) if w != Some(64) => Ok((s, w)),
+                _ => Ok((shader, Some(64))),
             }
         }
         other => other,
@@ -825,6 +873,138 @@ fn widen(
             }
         }
         wide.extend(more);
+    }
+}
+
+/// `CS_CollectTriangles_Meshlets`. Container bytes 4..20.
+const MESHLETS: [u8; 16] = [
+    0xb8, 0x5d, 0x78, 0xdd, 0x26, 0xe6, 0x96, 0x3e, 0x95, 0xfa, 0x09, 0xcd, 0xf5, 0x59, 0x6d, 0xb6,
+];
+
+/// `CS_CollectTriangles`. Container bytes 4..20. Same group and the same
+/// shared-memory shape as [`MESHLETS`], so it takes that path.
+const COLLECT: [u8; 16] = [
+    0xf4, 0xb4, 0xb3, 0xfb, 0x31, 0xf3, 0x34, 0x55, 0xb3, 0x39, 0x1c, 0x37, 0x74, 0x10, 0x84, 0x8b,
+];
+
+/// `CS_BuildProjDecalTrailVertexBufferFromNodes`. Container bytes 4..20.
+/// Group of 512. Its barriers compare one shared-memory word, so the whole
+/// group takes them together.
+const DECAL_NODES: [u8; 16] = [
+    0x76, 0x89, 0x2e, 0x3e, 0x72, 0xc3, 0x2c, 0x65, 0x00, 0x24, 0x11, 0xc5, 0x53, 0x84, 0x09, 0x28,
+];
+
+/// `CS_BuildProjDecalTrailProjectionBoxInstances`. Container bytes 4..20.
+/// Same group of 512 and the same kind of barrier as [`DECAL_NODES`].
+const DECAL_BOXES: [u8; 16] = [
+    0x2c, 0xdc, 0x63, 0xc7, 0xd2, 0x2a, 0x4d, 0x1e, 0x2a, 0xc4, 0xb3, 0xf5, 0x78, 0xd0, 0x18, 0xe4,
+];
+
+/// Wave 32 for meshlets when every cross-lane value can be exchanged inside
+/// its console wave. Anything that would wait for another wave, or for a
+/// half that does not run the block, is a named refusal. The program never
+/// comes out still asking for wave 64.
+fn meshlet_emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    // A branch taken by the whole wave changes which later branches are
+    // per-lane. Repeat until every read-and-write region is covered, or a
+    // pass adds nothing: that one is refused below, not forced.
+    let mut wide = std::collections::HashSet::new();
+    let mut widened: Option<structure::Structured> = None;
+    loop {
+        let at = widened.as_ref().unwrap_or(st);
+        let mut branches = lower::meshlet_lds_branches(p, at)
+            .map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+        for b in lower::meshlet_barrier_branches(p, at)
+            .map_err(|what| ShaderError::Unsupported { offset: 0, what })?
+        {
+            if !branches.contains(&b) {
+                branches.push(b);
+            }
+        }
+        if branches.iter().all(|b| wide.contains(b)) {
+            break;
+        }
+        wide.extend(branches);
+        widened = Some(structure::structure_wide(p, &wide)?);
+    }
+    // An exchange that one half does not run names its block. The per-lane
+    // branch around it is taken by the whole wave, then the two halves meet.
+    // A pass that adds no branch, or a branch with no wave-wide meaning, keeps
+    // the named refusal. The other waves of the group do not wait.
+    loop {
+        lower::take_needs();
+        let outcome = if let Some(st) = &widened {
+            let io = io::raise(p, native)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(st))?;
+            meshlet_lower(c, native, p, st, &io, &res)
+        } else {
+            meshlet_lower(c, native, p, st, io, res)
+        };
+        match outcome {
+            Ok(shader) => {
+                let _ = lower::take_needs();
+                return Ok(shader);
+            }
+            Err(ShaderError::Unsupported { what, .. })
+                if what == lower::MESHLET_HALF || lower::needs_every_lane(what) =>
+            {
+                let needs = lower::take_needs();
+                let at = widened.as_ref().unwrap_or(st);
+                let Some(branches) = lower::branches_around(at, &needs) else {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: lower::MESHLET_WAVE,
+                    });
+                };
+                if branches.iter().all(|b| wide.contains(b)) {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: lower::MESHLET_HALF,
+                    });
+                }
+                wide.extend(branches);
+                widened = Some(structure::structure_wide(p, &wide)?);
+            }
+            Err(e) => {
+                let _ = lower::take_needs();
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn meshlet_lower(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if let Err(what) = lower::meshlet_exchange(p, st) {
+        return Err(ShaderError::Unsupported { offset: 0, what });
+    }
+    let again = lower::with_wave_exchange(|| emit_program(c, native, p, st, io, res));
+    match again {
+        Ok((shader, wave)) if wave != Some(64) => Ok(shader),
+        Ok(_) => Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "meshlet exchanges did not reach wave 32",
+        }),
+        Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what) => {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: lower::MESHLET_HALF,
+            })
+        }
+        Err(e) => Err(e),
     }
 }
 

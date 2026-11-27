@@ -843,6 +843,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // PIX's capture library, before the device (`VICTORY_PIX_CAPTURE`).
+    #[cfg(feature = "diagnostics")]
+    crate::capture::pix_load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -9850,6 +9853,97 @@ pub(crate) fn bind_defrag_counter(list: &ID3D12GraphicsCommandList) -> Option<u6
         counter.armed = true;
     }
     Some(counter.va)
+}
+
+struct MeshletScratch {
+    gpu: ID3D12Resource,
+    upload: ID3D12Resource,
+    va: u64,
+    /// The ticket dword has been zeroed on some list.
+    armed: bool,
+}
+
+static MESHLET_SCRATCH: Mutex<Option<MeshletScratch>> = Mutex::new(None);
+
+fn scratch_buffer(
+    device: &ID3D12Device,
+    bytes: u64,
+    kind: D3D12_HEAP_TYPE,
+    flags: D3D12_RESOURCE_FLAGS,
+    state: D3D12_RESOURCE_STATES,
+) -> windows::core::Result<ID3D12Resource> {
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: a buffer of `bytes`. The caller keeps it.
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            },
+            state,
+            None,
+            &mut made,
+        )?;
+    }
+    made.ok_or_else(windows::core::Error::empty)
+}
+
+/// The meshlet exchange buffer. The first list to bind it zeroes the ticket
+/// before the dispatch. Each group zeroes its own region after that.
+pub(crate) fn bind_meshlet_scratch(list: &ID3D12GraphicsCommandList) -> Option<u64> {
+    let host = host()?;
+    let mut slot = MESHLET_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        let bytes = victory_shader::emit::meshlet_scratch_bytes();
+        let gpu = scratch_buffer(
+            &host.device,
+            bytes,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )
+        .ok()?;
+        let upload = scratch_buffer(
+            &host.device,
+            16,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )
+        .ok()?;
+        // SAFETY: the upload mapping covers the 16 bytes just created.
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut data)).ok()?;
+            std::ptr::write_bytes(data, 0, 16);
+            upload.Unmap(0, None);
+        }
+        let va = unsafe { gpu.GetGPUVirtualAddress() };
+        *slot = Some(MeshletScratch { gpu, upload, va, armed: false });
+    }
+    let scratch = slot.as_mut()?;
+    if !scratch.armed {
+        // SAFETY: the list is open and records this before the dispatch that meets.
+        unsafe {
+            list.CopyBufferRegion(&scratch.gpu, 0, &scratch.upload, 0, 16);
+            list.ResourceBarrier(&[transition(
+                &scratch.gpu,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        scratch.armed = true;
+    }
+    Some(scratch.va)
 }
 
 /// Reads the face-relocation counters after the queue has finished what it
